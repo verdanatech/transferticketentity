@@ -1,31 +1,32 @@
 <?php
-/**
- * -------------------------------------------------------------------------
- * LICENSE
- *
- * This file is part of Transferticketentity plugin for GLPI.
- *
- * Transferticketentity is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Transferticketentity is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with Reports. If not, see <http://www.gnu.org/licenses/>.
- *
- * @category  Ticket
- * @package   Transferticketentity
- * @author    Yannick Comba <y.comba@maine-et-loire.fr>
- * @copyright 2015-2023 Département de Maine et Loire plugin team
- * @license   AGPL License 3.0 or (at your option) any later version
- * https://www.gnu.org/licenses/gpl-3.0.html
- * @link      https://github.com/departement-maine-et-loire/
- * --------------------------------------------------------------------------
+
+/*
+ -------------------------------------------------------------------------
+ LICENSE
+
+ This file is part of Transferticketentity plugin for GLPI.
+
+ Transferticketentity is free software: you can redistribute it and/or modify
+ it under the terms of the GNU Affero General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+
+ Transferticketentity is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU Affero General Public License for more details.
+
+ You should have received a copy of the GNU Affero General Public License
+ along with Reports. If not, see <http://www.gnu.org/licenses/>.
+
+ @category  Ticket
+ @package   Transferticketentity
+ @author    Yannick Comba, Xavier Caillaud, Infotel
+ @copyright 2015-2026 Transferticketentity team
+ @license   AGPL License 3.0 or (at your option) any later version
+            https://www.gnu.org/licenses/gpl-3.0.html
+ @link      https://github.com/pluginsGLPI/transferticketentity/
+ --------------------------------------------------------------------------
  */
 
 namespace GlpiPlugin\Transferticketentity;
@@ -41,9 +42,10 @@ use Group;
 use Group_Ticket;
 use Group_User;
 use Html;
-use Planning;
 use Session;
 use Ticket_User;
+use ITILFollowup;
+use Planning;
 use TicketTask;
 use TicketTemplateMandatoryField;
 
@@ -202,7 +204,7 @@ class Ticket extends CommonDBTM
                 'root_plugin' => PLUGIN_TRANSFERTICKETENTITY_WEBDIR,
                 'action' => $target,
                 'id_ticket' => $ticket->getID(),
-                'entities_id' => $ticket->getID(),
+                'entities_id' => $ticket->fields['entities_id'],
                 'entities_name' => $entity->getName(),
                 'entities' => $entities_selection,
                 'group_required' => $group_required,
@@ -453,6 +455,18 @@ class Ticket extends CommonDBTM
     {
         global $CFG_GLPI;
 
+        // Enforce the real UPDATE authorization on the SOURCE ticket before any write.
+        // The plugin READ right and checkAssign() alone are not enough to gate a mutation
+        // that changes the ticket entity, status and actors: a forged POST could otherwise
+        // reach this path. can($id, UPDATE) also verifies the ticket belongs to an entity
+        // the user can access, which closes the cross-entity IDOR reachable through the
+        // "bypass" right. This intentionally guards the SOURCE ticket only: a technician is
+        // still allowed to transfer INTO a target entity they do not manage (feature intent).
+        $source_ticket = new \Ticket();
+        if (!$source_ticket->can((int) ($params['id_ticket'] ?? 0), UPDATE)) {
+            throw new \Glpi\Exception\Http\AccessDeniedHttpException();
+        }
+
         $checkAssign = self::checkAssign($params);
         $checkEntity = self::checkEntityETT();
         $checkGroup = self::checkGroup($params);
@@ -550,7 +564,7 @@ class Ticket extends CommonDBTM
                 'entities_id' => $params['entity_choice'],
             ];
 
-            if ($params['group_choice'] && $params['group_choice'] > 0) {
+            if (!empty($params['group_choice']) && $params['group_choice'] > 0) {
                 $ticket_status = ['status' => CommonITILObject::ASSIGNED];
                 $ticket_update = array_merge($ticket_update, $ticket_status);
             } else {
@@ -558,20 +572,19 @@ class Ticket extends CommonDBTM
                 $ticket_update = array_merge($ticket_update, $ticket_status);
             }
 
-            // In case keep_category is at yes and category doesn't exist, reset category's ticket
-            if ($checkEntityRight['keep_category'] && !$checkExistingCategory) {
-                $ticket_category = ['itilcategories_id' => 0];
-                $ticket_update = array_merge($ticket_update, $ticket_category);
-            }
-
-            if (!$checkEntityRight['keep_category']) {
-                if ($checkEntityRight['itilcategories_id'] == null) {
-                    $ticket_category = ['itilcategories_id' => 0];
+            if ($checkEntityRight['keep_category']) {
+                if ($checkExistingCategory) {
+                    // Explicitly include the current category so GLPI does not reset it on entity change
+                    $currentTicket = new \Ticket();
+                    $currentTicket->getFromDB($params['id_ticket']);
+                    $ticket_category = ['itilcategories_id' => $currentTicket->fields['itilcategories_id']];
                 } else {
-                    $ticket_category = ['itilcategories_id' => $checkEntityRight['itilcategories_id']];
+                    $ticket_category = ['itilcategories_id' => 0];
                 }
-                $ticket_update = array_merge($ticket_update, $ticket_category);
+            } else {
+                $ticket_category = ['itilcategories_id' => $checkEntityRight['itilcategories_id'] ?? 0];
             }
+            $ticket_update = array_merge($ticket_update, $ticket_category);
 
             // If category is mandatory with GLPIs template and category will be null
             if ($ticket_category['itilcategories_id'] == 0
@@ -633,26 +646,36 @@ class Ticket extends CommonDBTM
                 }
             }
 
-            $groupText = "<br> <br> $justification";
+            $content = __("Transfer to", "transferticketentity") . " $theEntity";
 
-            if (isset($params['group_choice'])
-                && $params['group_choice'] > 0) {
+            if (!empty($params['group_choice']) && $params['group_choice'] > 0) {
                 $group = new Group();
-                $group->getfromDB($params['group_choice']);
-                $groupText = __("in the group", "transferticketentity") ." ". $group->getName() ."\n <br> <br> $justification";
+                $group->getFromDB($params['group_choice']);
+                $content .= " " . __("in the group", "transferticketentity") . " " . $group->getName();
             }
 
-            // Log the transfer in a task
-            $task = new TicketTask();
-            $task->add([
-                'tickets_id' => $params['id_ticket'],
-                'is_private' => true,
-                'state' => Planning::INFO,
-                'content' => __(
-                    "Escalation to",
-                    "transferticketentity"
-                ) . " $theEntity " . $groupText
-            ]);
+            if (!empty($justification)) {
+                $content .= "<br><br>" . $justification;
+            }
+
+            // Log the transfer as a followup or task depending on entity configuration
+            if (($checkEntityRight['log_type'] ?? 0) == 1) {
+                $task = new TicketTask();
+                $task->add([
+                    'tickets_id' => $params['id_ticket'],
+                    'is_private' => true,
+                    'state'      => Planning::INFO,
+                    'content'    => $content,
+                ]);
+            } else {
+                $followup = new ITILFollowup();
+                $followup->add([
+                    'itemtype'  => \Ticket::class,
+                    'items_id'  => $params['id_ticket'],
+                    'is_private' => true,
+                    'content'   => $content,
+                ]);
+            }
 
             $ticket = new \Ticket();
             $ticket->getFromDB($params['id_ticket']);
